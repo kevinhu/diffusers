@@ -12,11 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import Optional
+import os
+from inspect import isfunction
+from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from diffusers.utils.import_utils import is_xformers_available
+
+
+if is_xformers_available():
+    import xformers
+    import xformers.ops
+
+    _USE_MEMORY_EFFICIENT_ATTENTION = int(os.environ.get("USE_MEMORY_EFFICIENT_ATTENTION", 0)) == 1
+else:
+    xformers = None
+    _USE_MEMORY_EFFICIENT_ATTENTION = False
+
+
+def exists(val):
+    return val is not None
+
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
 
 
 class AttentionBlock(nn.Module):
@@ -25,7 +49,6 @@ class AttentionBlock(nn.Module):
     to the N-d case.
     https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/models/unet.py#L66.
     Uses three q, k, v linear layers to compute attention.
-
     Parameters:
         channels (:obj:`int`): The number of channels in the input and output.
         num_head_channels (:obj:`int`, *optional*):
@@ -108,7 +131,6 @@ class SpatialTransformer(nn.Module):
     """
     Transformer block for image-like data. First, project the input (aka embedding) and reshape to b, t, d. Then apply
     standard transformer action. Finally, reshape to image.
-
     Parameters:
         in_channels (:obj:`int`): The number of channels in the input and output.
         n_heads (:obj:`int`): The number of heads to use for multi-head attention.
@@ -168,7 +190,6 @@ class SpatialTransformer(nn.Module):
 class BasicTransformerBlock(nn.Module):
     r"""
     A basic Transformer block.
-
     Parameters:
         dim (:obj:`int`): The number of channels in the input and output.
         n_heads (:obj:`int`): The number of heads to use for multi-head attention.
@@ -190,11 +211,12 @@ class BasicTransformerBlock(nn.Module):
         checkpoint: bool = True,
     ):
         super().__init__()
-        self.attn1 = CrossAttention(
+        AttentionBuilder = MemoryEfficientCrossAttention if _USE_MEMORY_EFFICIENT_ATTENTION else CrossAttention
+        self.attn1 = AttentionBuilder(
             query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout
         )  # is a self-attention
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
-        self.attn2 = CrossAttention(
+        self.attn2 = AttentionBuilder(
             query_dim=dim, context_dim=context_dim, heads=n_heads, dim_head=d_head, dropout=dropout
         )  # is self-attn if context is none
         self.norm1 = nn.LayerNorm(dim)
@@ -213,10 +235,56 @@ class BasicTransformerBlock(nn.Module):
         return hidden_states
 
 
+class MemoryEfficientCrossAttention(nn.Module):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        context_dim = default(context_dim, query_dim)
+
+        self.heads = heads
+        self.dim_head = dim_head
+
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim), nn.Dropout(dropout))
+        self.attention_op: Optional[Any] = None
+
+    def forward(self, x, context=None, mask=None):
+        q = self.to_q(x)
+        context = default(context, x)
+        k = self.to_k(context)
+        v = self.to_v(context)
+
+        b, _, _ = q.shape
+        q, k, v = map(
+            lambda t: t.unsqueeze(3)
+            .reshape(b, t.shape[1], self.heads, self.dim_head)
+            .permute(0, 2, 1, 3)
+            .reshape(b * self.heads, t.shape[1], self.dim_head)
+            .contiguous(),
+            (q, k, v),
+        )
+
+        # actually compute the attention, what we cannot get enough of
+        out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=self.attention_op)
+
+        # TODO: Use this directly in the attention operation, as a bias
+        if exists(mask):
+            raise NotImplementedError
+        out = (
+            out.unsqueeze(0)
+            .reshape(b, self.heads, out.shape[1], self.dim_head)
+            .permute(0, 2, 1, 3)
+            .reshape(b, out.shape[1], self.heads * self.dim_head)
+        )
+        return self.to_out(out)
+
+
 class CrossAttention(nn.Module):
     r"""
     A cross attention layer.
-
     Parameters:
         query_dim (:obj:`int`): The number of channels in the query.
         context_dim (:obj:`int`, *optional*):
@@ -339,7 +407,6 @@ class CrossAttention(nn.Module):
 class FeedForward(nn.Module):
     r"""
     A feed-forward layer.
-
     Parameters:
         dim (:obj:`int`): The number of channels in the input.
         dim_out (:obj:`int`, *optional*): The number of channels in the output. If not given, defaults to `dim`.
@@ -366,7 +433,6 @@ class FeedForward(nn.Module):
 class GEGLU(nn.Module):
     r"""
     A variant of the gated linear unit activation function from https://arxiv.org/abs/2002.05202.
-
     Parameters:
         dim_in (:obj:`int`): The number of channels in the input.
         dim_out (:obj:`int`): The number of channels in the output.
